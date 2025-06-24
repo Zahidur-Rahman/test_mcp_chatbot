@@ -328,13 +328,14 @@ class SQLGenerator:
             ])
             
             # Create enhanced prompt
-            system_prompt = f"""You are an expert PostgreSQL query generator. Your task is to convert natural language requests into syntactically correct SELECT queries.
+            system_prompt = f"""You are an expert PostgreSQL query generator. Your task is to convert natural language requests into syntactically correct SELECT queries.Also if the question is about 
+            normal conversation reply with your own general knowledge.Do not use database as context when it is about normal conversation.
 
-IMPORTANT RULES:
+IMPORTANT RULES FOR WHEN YOU WILL GENERATE SQL:
 1. ONLY generate SELECT statements - never use DROP, DELETE, INSERT, UPDATE, ALTER, CREATE, TRUNCATE
 2. Output ONLY the SQL query - no explanations, no markdown, no code blocks
-3. Use proper PostgreSQL syntax
-4. If the request cannot be fulfilled with a SELECT query, respond with: "-- Operation not allowed"
+3. If there is database error suggest something specific to do.
+4. Use proper PostgreSQL syntax
 5. Use table and column names exactly as provided in the schema
 
 DATABASE SCHEMA:
@@ -355,15 +356,16 @@ Generate a SELECT query for the following request."""
             model = self.get_model()
             response = await model.ainvoke(messages)
             
+            print("=== RAW LLM OUTPUT ===")
+            print(response.content)
+            print("=== END RAW LLM OUTPUT ===")
+            
             # Clean up the response
             sql_query = response.content.strip()
             
             # Remove any markdown code blocks
             sql_query = re.sub(r'```sql\s*', '', sql_query)
             sql_query = re.sub(r'```\s*', '', sql_query)
-            
-            # Take only the first line if multiple lines
-            sql_query = sql_query.split('\n')[0].strip()
             
             # Remove common prefixes
             sql_query = re.sub(r'^(SQL|Query):\s*', '', sql_query, flags=re.IGNORECASE)
@@ -431,49 +433,36 @@ async def chat(request: ChatRequest):
         logger.info(f"Processing chat request: {request.message[:100]}...")
         
         # Generate SQL query
-        sql_query = await sql_generator.generate_sql(
+        llm_response = await sql_generator.generate_sql(
             request.message, 
             request.conversation_history
         )
         
-        if sql_query.startswith("-- Error") or sql_query.startswith("-- Operation not allowed"):
+        # If the response looks like a SQL query, execute it; otherwise, treat as normal conversation
+        if llm_response.strip().upper().startswith("SELECT"):
+            result = await db_manager.execute_query(llm_response)
+            if "error" in result:
+                return ChatResponse(
+                    response=result["error"],
+                    sql_query=llm_response,
+                    tools_used=["sql_generator", "database"],
+                    execution_time=asyncio.get_event_loop().time() - start_time
+                )
+            else:
+                return ChatResponse(
+                    response=json.dumps(result, indent=2, default=str),
+                    sql_query=llm_response,
+                    tools_used=["sql_generator", "database"],
+                    execution_time=asyncio.get_event_loop().time() - start_time
+                )
+        else:
+            # Normal conversation, just return the LLM's response
             return ChatResponse(
-                response=sql_query,
-                sql_query=sql_query,
-                tools_used=[],
+                response=llm_response,
+                sql_query=None,
+                tools_used=["llm"],
                 execution_time=asyncio.get_event_loop().time() - start_time
             )
-        
-        # Execute the query
-        result = await db_manager.execute_query(sql_query)
-        
-        # Format response
-        if "error" in result:
-            response_text = f"SQL Query: {sql_query}\n\nError: {result['error']}"
-        else:
-            if "columns" in result and "rows" in result:
-                response_text = f"SQL Query: {sql_query}\n\n"
-                response_text += f"Results: {result['row_count']} rows returned\n"
-                response_text += f"Columns: {', '.join(result['columns'])}\n\n"
-                
-                if result['rows']:
-                    response_text += "Sample data (first 10 rows):\n"
-                    for i, row in enumerate(result['rows'][:10], 1):
-                        response_text += f"{i}. {dict(row)}\n"
-                    
-                    if result['row_count'] > 10:
-                        response_text += f"... and {result['row_count'] - 10} more rows"
-                else:
-                    response_text += "No data returned"
-            else:
-                response_text = f"SQL Query: {sql_query}\n\n{result.get('message', 'Query executed')}"
-        
-        return ChatResponse(
-            response=response_text,
-            sql_query=sql_query,
-            tools_used=["sql_generator", "database"],
-            execution_time=asyncio.get_event_loop().time() - start_time
-        )
         
     except Exception as e:
         logger.error(f"Chat error: {e}")

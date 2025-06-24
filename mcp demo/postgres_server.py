@@ -7,6 +7,13 @@ from contextlib import contextmanager
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from typing import List, Dict, Optional
+import re
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from langchain.memory import ConversationBufferWindowMemory
+from langchain_mistralai import ChatMistralAI
+from langchain_core.messages import HumanMessage, SystemMessage
 
 # MCP imports for stdio transport
 from mcp.server import Server
@@ -33,6 +40,15 @@ logger.info(f"Current working directory: {os.getcwd()}")
 
 # Create MCP server for stdio transport
 server = Server("postgres-mcp-server")
+
+# Store only the last 20 input/output pairs
+memory = ConversationBufferWindowMemory(k=20)
+
+class ChatResponse(BaseModel):
+    result: Optional[dict] = None
+    error: Optional[str] = None
+    tools_used: List[str] = Field(default_factory=list)
+    execution_time: Optional[float] = None
 
 @contextmanager
 def get_db_connection():
@@ -95,36 +111,70 @@ async def list_tools() -> list[Tool]:
                 "properties": {},
                 "required": []
             }
+        ),
+        Tool(
+            name="get_all_foreign_keys",
+            description="Get all foreign key relationships in the database",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ),
+        Tool(
+            name="get_full_schema",
+            description="Get full schema: tables, columns, and foreign keys",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
         )
     ]
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict) -> ChatResponse:
     """Handle tool calls"""
+    start_time = asyncio.get_event_loop().time()
     logger.info(f"Tool called: {name} with arguments: {arguments}")
     
     try:
-        if name == "execute_query":
-            result = await execute_query(arguments.get("query", ""))
-            return [TextContent(type="text", text=result)]
-        
-        elif name == "get_table_schema":
-            result = await get_table_schema(arguments.get("table_name", ""))
-            return [TextContent(type="text", text=result)]
-        
-        elif name == "list_tables":
-            result = await list_tables()
-            return [TextContent(type="text", text=result)]
-        
-        else:
-            error_msg = f"Unknown tool: {name}"
-            logger.error(error_msg)
-            return [TextContent(type="text", text=json.dumps({"error": error_msg}))]
+        # 1. Get conversation history
+        history = memory.load_memory_variables({})["history"]
+        user_input = arguments.get("query") or ""
+
+        # 2. Build messages list
+        messages = [
+            SystemMessage(content="This is a conversation between a user and an assistant."),
+            HumanMessage(content=history),
+            HumanMessage(content=user_input)
+        ]
+
+        # 3. Get LLM response
+        llm = ChatMistralAI(
+            model="mistral-large-2407",
+            api_key=os.getenv("MISTRAL_API_KEY")
+        )
+        bot_output = await llm.ainvoke(messages)
+
+        # 4. Save the turn to memory
+        memory.save_context({"input": user_input}, {"output": bot_output.content})
+
+        # 5. Return the response
+        return ChatResponse(
+            result={"response": bot_output.content},
+            tools_used=["mistral", "memory"],
+            execution_time=asyncio.get_event_loop().time() - start_time
+        )
     
     except Exception as e:
         error_msg = f"Error executing tool {name}: {str(e)}"
         logger.error(error_msg)
-        return [TextContent(type="text", text=json.dumps({"error": error_msg}))]
+        return ChatResponse(
+            error=error_msg,
+            tools_used=["sql_generator", "database"],
+            execution_time=asyncio.get_event_loop().time() - start_time
+        )
 
 async def execute_query(query: str) -> str:
     """Execute a SQL query and return results"""
@@ -160,14 +210,14 @@ async def execute_query(query: str) -> str:
                     "count": len(data)
                 }
                 logger.info(f"Query returned {len(data)} rows")
-                return json.dumps(response, indent=2, default=str)
+                return response
             else:
                 conn.commit()
                 response = {
                     "message": f"Query executed successfully. Rows affected: {cursor.rowcount}",
                     "rows_affected": cursor.rowcount
                 }
-                return json.dumps(response, indent=2)
+                return response
                 
     except psycopg2.Error as e:
         error_msg = f"Database error: {str(e)}"
@@ -234,7 +284,7 @@ async def get_table_schema(table_name: str) -> str:
                 schema_info["columns"].append(column_info)
             
             logger.info(f"Schema retrieved for table {table_name}: {len(columns)} columns")
-            return json.dumps(schema_info, indent=2)
+            return schema_info
             
     except psycopg2.Error as e:
         error_msg = f"Database error getting schema: {str(e)}"
@@ -278,7 +328,7 @@ async def list_tables() -> str:
             }
             
             logger.info(f"Listed {len(tables)} tables")
-            return json.dumps(table_info, indent=2)
+            return table_info
             
     except psycopg2.Error as e:
         error_msg = f"Database error listing tables: {str(e)}"
@@ -288,6 +338,57 @@ async def list_tables() -> str:
         error_msg = f"Unexpected error listing tables: {str(e)}"
         logger.error(error_msg)
         return json.dumps({"error": error_msg})
+
+async def get_all_foreign_keys() -> str:
+    """Get all foreign key relationships in the database"""
+    logger.info("Getting all foreign keys")
+    query = """
+        SELECT
+            tc.table_name AS table_name,
+            kcu.column_name AS column_name,
+            ccu.table_name AS foreign_table_name,
+            ccu.column_name AS foreign_column_name
+        FROM
+            information_schema.table_constraints AS tc
+            JOIN information_schema.key_column_usage AS kcu
+              ON tc.constraint_name = kcu.constraint_name
+              AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.constraint_column_usage AS ccu
+              ON ccu.constraint_name = tc.constraint_name
+              AND ccu.table_schema = tc.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public';
+    """
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(query)
+            fks = cursor.fetchall()
+    return json.dumps({"foreign_keys": fks}, indent=2)
+
+async def get_full_schema() -> str:
+    """Get full schema: tables, columns, and foreign keys"""
+    logger.info("Getting full schema")
+    # Get tables and columns
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+            ORDER BY table_name;
+        """)
+        tables = [row['table_name'] for row in cursor.fetchall()]
+        schema = {}
+        for table in tables:
+            cursor.execute("""
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_name = %s AND table_schema = 'public'
+                ORDER BY ordinal_position;
+            """, (table,))
+            schema[table] = cursor.fetchall()
+    # Get foreign keys
+    fks = json.loads(await get_all_foreign_keys())['foreign_keys']
+    return json.dumps({"tables": schema, "foreign_keys": fks}, indent=2)
 
 async def main():
     """Main function to run the MCP server"""
